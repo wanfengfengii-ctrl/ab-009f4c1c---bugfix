@@ -2,20 +2,35 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Aliaser } from "../src/alias.ts";
-import { contentHash } from "../src/canonical.ts";
-import { validateSharedManifest } from "../src/sharedValidation.ts";
+import { canonicalize } from "../src/canonical.ts";
+import {
+  MIGRATED_CONTENT_KEY_ID,
+  contentKeyId,
+  deriveContentKey,
+  neutralizedLegacyContentHash,
+  publicContentHash,
+} from "../src/contentKey.ts";
+import { validatePersistedManifest, validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
+import { CorruptManifestError } from "../src/types.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const CONTENT_KEY = deriveContentKey(SECRET);
+const KEY_ID = contentKeyId(CONTENT_KEY);
 
 function fileNameFor(batchId: string): string {
   return createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
+}
+
+/** Plain unkeyed SHA-256 as produced by the pre-upgrade write path. */
+function legacyContentHash(batch: ReturnType<typeof validateBatch>): string {
+  return createHash("sha256").update(canonicalize(batch), "utf8").digest("hex");
 }
 
 function validBody(batchId: string): Record<string, unknown> {
@@ -68,13 +83,13 @@ async function writeEntry(dir: string, fileName: string, value: unknown): Promis
 test("recovery: a valid persisted manifest survives a restart", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-ok-"));
   const batch = validateBatch(validBody("batch-restore-ok"));
-  const hash = contentHash(batch);
-  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const hash = publicContentHash(batch, CONTENT_KEY);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, KEY_ID);
 
-  const first = new ManifestStore(dir);
+  const first = new ManifestStore(dir, CONTENT_KEY);
   assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, CONTENT_KEY);
   await restarted.load();
   assert.deepEqual(restarted.get("batch-restore-ok"), manifest);
   // Idempotency/conflict semantics are intact over restored entries.
@@ -87,13 +102,13 @@ test("recovery: the corrupt restore-batch sample aborts startup and is never ser
 
   // A fully valid entry sits next to the corrupt one.
   const batch = validateBatch(validBody("batch-healthy"));
-  const hash = contentHash(batch);
-  const first = new ManifestStore(dir);
-  await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash));
+  const hash = publicContentHash(batch, CONTENT_KEY);
+  const first = new ManifestStore(dir, CONTENT_KEY);
+  await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash, KEY_ID));
 
   await writeEntry(dir, fileNameFor("restore-batch"), CORRUPT_SAMPLE);
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, CONTENT_KEY);
   let failure: unknown;
   try {
     await restarted.load();
@@ -138,10 +153,11 @@ test("recovery: duplicate record aliases in a persisted entry are rejected", asy
     batchId: "batch-dup-alias",
     createdAt: "2026-10-04T00:00:00.000Z",
     contentHash: "0".repeat(64),
+    contentKeyId: KEY_ID,
     records: [record, { ...record }],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, CONTENT_KEY);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dup-alias"), undefined);
 });
@@ -152,6 +168,7 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
     batchId: "batch-dangling-alias",
     createdAt: "2026-10-04T00:00:00.000Z",
     contentHash: "0".repeat(64),
+    contentKeyId: KEY_ID,
     records: [
       {
         recordAlias: `rec-${"a".repeat(32)}`,
@@ -163,7 +180,7 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
     ],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, CONTENT_KEY);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dangling-alias"), undefined);
 });
@@ -171,12 +188,12 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
 test("recovery: file name must match the SHA-256 binding of its batchId", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-binding-"));
   const batch = validateBatch(validBody("batch-binding"));
-  const hash = contentHash(batch);
-  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const hash = publicContentHash(batch, CONTENT_KEY);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, KEY_ID);
   // Persist the valid document under the WRONG file name.
   await writeEntry(dir, fileNameFor("some-other-batch"), manifest);
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, CONTENT_KEY);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-binding"), undefined);
 });
@@ -185,13 +202,13 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-json-"));
   await writeEntry(dir, fileNameFor("batch-broken"), "{not valid json");
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, CONTENT_KEY);
   await assert.rejects(store.load(), CorruptStoreError);
 });
 
 test("shared manifest contract: field set, formats and scalar measurements", () => {
   const batch = validateBatch(validBody("batch-contract"));
-  const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));
+  const good = transformBatch(batch, new Aliaser(SECRET), publicContentHash(batch, CONTENT_KEY), KEY_ID);
   // A manifest produced by the write path always satisfies the contract.
   assert.deepEqual(validateSharedManifest(JSON.parse(JSON.stringify(good))), good);
 
@@ -217,6 +234,16 @@ test("shared manifest contract: field set, formats and scalar measurements", () 
       name: "contentHash wrong length",
       mutate: (m) => (m.contentHash = "abcd"),
       code: "invalid_content_hash",
+    },
+    {
+      name: "missing contentKeyId",
+      mutate: (m) => delete m.contentKeyId,
+      code: "missing_content_key_id",
+    },
+    {
+      name: "malformed contentKeyId",
+      mutate: (m) => (m.contentKeyId = "not a valid key id!"),
+      code: "invalid_content_key_id",
     },
     {
       name: "raw id in patientAlias",
@@ -272,4 +299,130 @@ test("shared manifest contract: field set, formats and scalar measurements", () 
       c.name,
     );
   }
+});
+
+test("recovery: strict validator rejects, legacy recovery accepts, an unkeyed pre-upgrade document", () => {
+  const batch = validateBatch(validBody("batch-legacy-shape"));
+  const v1 = transformBatch(batch, new Aliaser(SECRET), legacyContentHash(batch), KEY_ID);
+  const legacyDoc = JSON.parse(JSON.stringify(v1));
+  delete legacyDoc.contentKeyId; // exactly the persisted pre-upgrade shape
+
+  assert.throws(
+    () => validateSharedManifest(legacyDoc),
+    (err: unknown) =>
+      (err as { issues: { code: string }[] }).issues.some((i) => i.code === "missing_content_key_id"),
+  );
+  const recovered = validatePersistedManifest(legacyDoc, true);
+  assert.equal(recovered.legacyUnkeyed, true);
+  assert.deepEqual(recovered.manifest, { ...v1, contentKeyId: "" });
+  // Recovery without the legacy allowance stays strict.
+  assert.throws(() => validatePersistedManifest(legacyDoc, false), CorruptManifestError);
+});
+
+test("recovery: pre-upgrade unkeyed manifest stays queryable but its hash oracle is neutralized", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-legacy-"));
+  const batch = validateBatch(validBody("batch-legacy"));
+  const oldHash = legacyContentHash(batch);
+
+  // Simulate a file written by the pre-upgrade build: no contentKeyId, plain
+  // SHA-256 of the raw business content.
+  const legacyDoc = {
+    batchId: batch.batchId,
+    createdAt: "2026-09-30T00:00:00.000Z",
+    contentHash: oldHash,
+    records: transformBatch(batch, new Aliaser(SECRET), oldHash, KEY_ID).records,
+  };
+  await writeEntry(dir, fileNameFor(batch.batchId), legacyDoc);
+
+  const store = new ManifestStore(dir, CONTENT_KEY);
+  await store.load(); // must not abort: the legacy entry is otherwise contract-valid
+
+  // Still queryable after the upgrade, with the alias-only body intact.
+  const served = store.get(batch.batchId);
+  assert.ok(served, "a legitimate pre-upgrade manifest must remain queryable");
+  assert.equal(served!.records.length, 2);
+  assert.equal(served!.contentKeyId, MIGRATED_CONTENT_KEY_ID);
+
+  // The exposed hash is no longer the plain oracle, nor a plain transform of
+  // it: it must be the keyed neutralization, not reproducible without the key.
+  assert.notEqual(served!.contentHash, oldHash);
+  assert.equal(
+    served!.contentHash,
+    neutralizedLegacyContentHash(oldHash, CONTENT_KEY),
+  );
+  assert.notEqual(
+    served!.contentHash,
+    createHash("sha256").update(oldHash, "utf8").digest("hex"),
+    "an unkeyed transform of the old hash would remain an oracle",
+  );
+
+  // The on-disk file is rewritten (persisted neutralization), and a second
+  // restart converges to exactly the same value (idempotent, one-time).
+  const onDisk = JSON.parse(await readFile(join(dir, fileNameFor(batch.batchId)), "utf8"));
+  assert.equal(onDisk.contentHash, served!.contentHash);
+  assert.equal(onDisk.contentKeyId, MIGRATED_CONTENT_KEY_ID);
+  const restartedAgain = new ManifestStore(dir, CONTENT_KEY);
+  await restartedAgain.load();
+  assert.deepEqual(restartedAgain.get(batch.batchId), served);
+
+  // Enumerating candidate identifiers against the neutralized result fails:
+  // no plain digest of any guessed content matches the exposed value.
+  for (const candidatePatient of ["PAT-0", "PAT-1", "PAT-2"]) {
+    const guessed = validBody("batch-legacy");
+    (guessed.records as any[])[0].patientId = candidatePatient;
+    const plainGuess = legacyContentHash(validateBatch(guessed));
+    assert.notEqual(plainGuess, served!.contentHash);
+    // And the pre-upgrade hash (which the candidate owner could have stored)
+    // cannot be turned into the new value without the deployment key.
+    assert.notEqual(
+      neutralizedLegacyContentHash(plainGuess, deriveContentKey(Buffer.from("x".repeat(32), "utf8"))),
+      served!.contentHash,
+    );
+  }
+
+  // Re-submissions against a neutralized entry cannot be proven equal (the
+  // original identifiers are gone), so they answer with the existing 409 —
+  // both for identical and for different business content.
+  const rebuilt = transformBatch(
+    batch,
+    new Aliaser(SECRET),
+    publicContentHash(batch, CONTENT_KEY),
+    KEY_ID,
+  );
+  assert.equal(
+    (await store.create(batch.batchId, publicContentHash(batch, CONTENT_KEY), rebuilt)).status,
+    "conflict",
+  );
+  const changed = validateBatch(validBody("batch-legacy"));
+  (changed.records as any[])[1].measurements.ki67 = 31;
+  assert.equal(
+    (await store.create(batch.batchId, publicContentHash(changed, CONTENT_KEY), rebuilt)).status,
+    "conflict",
+  );
+});
+
+test("recovery: neutralization is keyed per deployment, so saved digests cannot be confirmed elsewhere", async () => {
+  const dirA = mkdtempSync(join(tmpdir(), "manifest-recovery-legacy-a-"));
+  const dirB = mkdtempSync(join(tmpdir(), "manifest-recovery-legacy-b-"));
+  const batch = validateBatch(validBody("batch-legacy-keys"));
+  const oldHash = legacyContentHash(batch);
+  const legacyDoc = {
+    batchId: batch.batchId,
+    createdAt: "2026-09-30T00:00:00.000Z",
+    contentHash: oldHash,
+    records: transformBatch(batch, new Aliaser(SECRET), oldHash, KEY_ID).records,
+  };
+  await writeEntry(dirA, fileNameFor(batch.batchId), legacyDoc);
+  await writeEntry(dirB, fileNameFor(batch.batchId), legacyDoc);
+
+  const otherKey = deriveContentKey(Buffer.from("fedcba9876543210fedcba9876543210", "utf8"));
+  const storeA = new ManifestStore(dirA, CONTENT_KEY);
+  const storeB = new ManifestStore(dirB, otherKey);
+  await storeA.load();
+  await storeB.load();
+  assert.notEqual(
+    storeA.get(batch.batchId)!.contentHash,
+    storeB.get(batch.batchId)!.contentHash,
+    "the same pre-upgrade hash neutralizes differently per deployment key",
+  );
 });

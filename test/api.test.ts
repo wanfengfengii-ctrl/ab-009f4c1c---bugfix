@@ -1,12 +1,18 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAppServer } from "../src/http.ts";
 import { ManifestStore } from "../src/store.ts";
+import { canonicalize } from "../src/canonical.ts";
+import { contentKeyId, deriveContentKey, publicContentHash } from "../src/contentKey.ts";
+import { validateBatch } from "../src/validation.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const CONTENT_KEY = deriveContentKey(SECRET);
+const KEY_ID = contentKeyId(CONTENT_KEY);
 const RAW_IDS = ["R-100", "R-200", "PAT-X", "ACC-X"];
 
 function batchA(): any {
@@ -36,9 +42,9 @@ let server: any;
 
 before(async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-api-"));
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, CONTENT_KEY);
   await store.load();
-  server = createAppServer({ store, aliasSecret: SECRET, maxBodyBytes: 1_000_000 });
+  server = createAppServer({ store, aliasSecret: SECRET, contentKey: CONTENT_KEY, maxBodyBytes: 1_000_000 });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
@@ -183,4 +189,58 @@ test("aliases stay consistent across batches while identifier classes stay isola
   assert.notEqual(dup.recordAlias, dup.patientAlias);
   assert.notEqual(dup.recordAlias, dup.accessionAlias);
   assert.notEqual(dup.patientAlias, dup.accessionAlias);
+});
+
+test("exposed contentHash is keyed: no candidate identifier is confirmable via POST or GET", async () => {
+  // A minimal, single-record, empty-measurements manifest: exactly the
+  // low-context shape in which a hash oracle is easiest to exploit.
+  const minimal = {
+    batchId: "oracle-probe",
+    records: [
+      { recordId: "ORC-R-1", patientId: "ORC-P-1", accessionId: "ORC-A-1", relatedIds: [], measurements: {} },
+    ],
+  };
+  const { status, json } = await post(minimal);
+  assert.equal(status, 201);
+  assert.match(json.contentHash, /^[0-9a-f]{64}$/);
+  // Every response carries the non-revealing key fingerprint.
+  assert.equal(json.contentKeyId, KEY_ID);
+  assert.match(json.contentKeyId, /^v2-[0-9a-f]{16}$/);
+
+  const got = await fetch(`${baseUrl}/api/manifests/oracle-probe`).then((r: any) => r.json());
+  assert.equal(got.contentHash, json.contentHash);
+  assert.equal(got.contentKeyId, KEY_ID);
+
+  // Independent plain SHA-256 over the raw business content must not match.
+  const plain = createHash("sha256")
+    .update(canonicalize(validateBatch(minimal)), "utf8")
+    .digest("hex");
+  assert.notEqual(json.contentHash, plain);
+
+  // Enumerate small candidate sets for each of the three identifier classes;
+  // the true value sits in every set, yet no plain candidate digest matches.
+  const enumerate = (cls: "recordId" | "patientId" | "accessionId"): void => {
+    for (const guess of ["X-0", "X-1", "X-2", "ORC-R-1", "ORC-P-1", "ORC-A-1"]) {
+      const candidate: any = {
+        batchId: "oracle-probe",
+        records: [
+          {
+            recordId: "ORC-R-1",
+            patientId: "ORC-P-1",
+            accessionId: "ORC-A-1",
+            relatedIds: [],
+            measurements: {},
+          },
+        ],
+      };
+      candidate.records[0][cls] = guess;
+      const digest = createHash("sha256")
+        .update(canonicalize(validateBatch(candidate)), "utf8")
+        .digest("hex");
+      assert.notEqual(digest, json.contentHash, `${cls} candidate ${guess} must not be confirmable`);
+    }
+  };
+  enumerate("recordId");
+  enumerate("patientId");
+  enumerate("accessionId");
 });

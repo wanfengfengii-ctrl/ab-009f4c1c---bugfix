@@ -1,16 +1,19 @@
 import { loadConfig } from "./config.ts";
+import { deriveContentKey } from "./contentKey.ts";
 import { createAppServer } from "./http.ts";
 import { log } from "./log.ts";
 import { ManifestStore } from "./store.ts";
 
 async function main(): Promise<void> {
   const config = await loadConfig();
-  const store = new ManifestStore(config.dataDir);
+  const contentKey = deriveContentKey(config.aliasSecret);
+  const store = new ManifestStore(config.dataDir, contentKey);
   await store.load();
 
   const server = createAppServer({
     store,
     aliasSecret: config.aliasSecret,
+    contentKey,
     maxBodyBytes: config.maxBodyBytes,
   });
 

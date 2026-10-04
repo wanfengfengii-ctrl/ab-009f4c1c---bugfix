@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { Aliaser } from "./alias.ts";
-import { contentHash } from "./canonical.ts";
+import { contentKeyId, publicContentHash } from "./contentKey.ts";
 import { transformBatch } from "./transform.ts";
 import { BATCH_ID_PATTERN, validateBatch } from "./validation.ts";
 import { log } from "./log.ts";
@@ -25,11 +25,15 @@ class HttpError extends Error {
 export interface ServerDeps {
   store: ManifestStore;
   aliasSecret: Buffer;
+  contentKey: Buffer;
   maxBodyBytes: number;
 }
 
 export function createAppServer(deps: ServerDeps) {
-  const { store, aliasSecret, maxBodyBytes } = deps;
+  const { store, aliasSecret, contentKey, maxBodyBytes } = deps;
+  // The content key (and hence its fingerprint) is fixed for the lifetime of
+  // the deployment; derive the public fingerprint once.
+  const keyId = contentKeyId(contentKey);
 
   function sendJson(res: any, status: number, payload: unknown): void {
     const body = JSON.stringify(payload);
@@ -78,11 +82,13 @@ export function createAppServer(deps: ServerDeps) {
     // validateBatch throws ValidationFailed listing only paths/rule codes,
     // never the submitted identifier values.
     const batch = validateBatch(raw);
-    const hash = contentHash(batch);
+    // Keyed content hash: unforgeable by recipients, so the exposed digest
+    // cannot confirm low-entropy guesses for the raw identifiers.
+    const hash = publicContentHash(batch, contentKey);
 
     // The aliaser is request scoped; the deployment secret is what makes
     // aliases consistent across batches.
-    const manifest = transformBatch(batch, new Aliaser(aliasSecret), hash);
+    const manifest = transformBatch(batch, new Aliaser(aliasSecret), hash, keyId);
 
     const outcome = await store.create(batch.batchId, hash, manifest);
     if (outcome.status === "conflict") {

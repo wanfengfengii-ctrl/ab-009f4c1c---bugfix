@@ -9,7 +9,12 @@ import type { InputBatch, SharedManifest, SharedRecord } from "./types.ts";
  * record-alias table, so the reference graph is preserved while no original
  * identifier survives. Measurement values pass through untouched.
  */
-export function transformBatch(batch: InputBatch, aliaser: Aliaser, hash: string): SharedManifest {
+export function transformBatch(
+  batch: InputBatch,
+  aliaser: Aliaser,
+  hash: string,
+  keyId: string,
+): SharedManifest {
   // Record aliases are resolved first so cross references resolve in one pass.
   const recordAliasById = new Map<string, string>();
   for (const record of batch.records) {
@@ -39,6 +44,7 @@ export function transformBatch(batch: InputBatch, aliaser: Aliaser, hash: string
     batchId: batch.batchId,
     createdAt: new Date().toISOString(),
     contentHash: hash,
+    contentKeyId: keyId,
     records: sharedRecords,
   };
 }

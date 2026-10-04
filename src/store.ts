@@ -4,7 +4,8 @@ import { readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
-import { validateSharedManifest } from "./sharedValidation.ts";
+import { validatePersistedManifest } from "./sharedValidation.ts";
+import { MIGRATED_CONTENT_KEY_ID, neutralizedLegacyContentHash } from "./contentKey.ts";
 import { log } from "./log.ts";
 
 /**
@@ -55,9 +56,18 @@ export class ManifestStore {
   private readonly locks = new Map<string, Promise<unknown>>();
 
   private readonly dataDir: string;
+  /**
+   * Deployment-only key for content hashes. Required for neutralizing
+   * pre-upgrade unkeyed hashes on recovery load.
+   */
+  private readonly contentKey: Buffer;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, contentKey: Buffer) {
+    if (!Buffer.isBuffer(contentKey) || contentKey.length < 16) {
+      throw new Error("content key must be a Buffer of at least 16 bytes");
+    }
     this.dataDir = dataDir;
+    this.contentKey = contentKey;
     mkdirSync(dataDir, { recursive: true });
   }
 
@@ -65,15 +75,27 @@ export class ManifestStore {
     return createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
   }
 
+  /** Atomically persist a shared manifest document (temp file + rename). */
+  private async persist(manifest: SharedManifest): Promise<void> {
+    const target = join(this.dataDir, this.fileName(manifest.batchId));
+    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, JSON.stringify(manifest), { mode: 0o600 });
+    await rename(tmp, target);
+  }
+
   async load(): Promise<void> {
     const entries = await readdir(this.dataDir);
     const corrupt: Array<{ file: string; issues: ValidationIssue[] }> = [];
+    /** Valid pre-upgrade entries awaiting hash neutralization. */
+    const pendingMigration: Array<{ file: string; manifest: SharedManifest }> = [];
     let count = 0;
     for (const entry of entries.sort()) {
       if (!entry.endsWith(".json")) continue;
-      const issues = await this.inspectEntry(entry);
-      if (issues.length > 0) {
-        corrupt.push({ file: entry, issues });
+      const result = await this.inspectEntry(entry);
+      if (result.kind === "corrupt") {
+        corrupt.push({ file: entry, issues: result.issues });
+      } else if (result.kind === "legacy") {
+        pendingMigration.push({ file: entry, manifest: result.manifest });
       } else {
         count++;
       }
@@ -81,6 +103,8 @@ export class ManifestStore {
     // Report every corrupt entry before aborting so a single restart cycle
     // surfaces all of them. The diagnostics contain only hashed file names,
     // rule codes and JSON paths — corrupt content itself is never logged.
+    // No file is migrated until every entry has been validated, so a corrupt
+    // volume always fails closed without partial rewrites.
     for (const entry of corrupt) {
       log.error("store_corrupt_entry", {
         file: entry.file,
@@ -90,55 +114,95 @@ export class ManifestStore {
     if (corrupt.length > 0) {
       throw new CorruptStoreError(corrupt.map((entry) => entry.file));
     }
-    log.info("store_loaded", { manifests: count });
+
+    // Neutralize pre-upgrade manifests: their unkeyed contentHash would let
+    // anyone with the response confirm low-entropy identifier guesses even
+    // after the upgrade. Rewrite to a keyed hash and stamp the marker,
+    // atomically, BEFORE the entry is admitted for serving. Idempotent: a
+    // manifest already stamped on an earlier restart is current-contract and
+    // never reaches here.
+    for (const { file, manifest } of pendingMigration) {
+      const neutralized: SharedManifest = {
+        ...manifest,
+        contentHash: neutralizedLegacyContentHash(manifest.contentHash, this.contentKey),
+        contentKeyId: MIGRATED_CONTENT_KEY_ID,
+      };
+      await this.persist(neutralized);
+      this.manifests.set(neutralized.batchId, neutralized);
+      count++;
+      log.info("store_legacy_hash_neutralized", { file });
+    }
+
+    log.info("store_loaded", { manifests: count, migrated: pendingMigration.length });
   }
 
   /**
-   * Validate one persisted entry. Returns the list of contract violations
-   * (empty when the entry is trustworthy); only fully valid entries are
-   * admitted into the in-memory index.
+   * Validate one persisted entry.
+   *  - "current": fully contract-compliant document, admitted as-is
+   *  - "legacy": valid pre-upgrade document lacking contentKeyId; its unkeyed
+   *    hash must be neutralized before serving
+   *  - "corrupt": contract violations; the entry is never admitted and the
+   *    whole load aborts
    */
-  private async inspectEntry(entry: string): Promise<ValidationIssue[]> {
+  private async inspectEntry(
+    entry: string,
+  ): Promise<
+    | { kind: "current"; manifest: SharedManifest }
+    | { kind: "legacy"; manifest: SharedManifest }
+    | { kind: "corrupt"; issues: ValidationIssue[] }
+  > {
     let raw: string;
     try {
       raw = await readFile(join(this.dataDir, entry), "utf8");
     } catch {
-      return [
-        { code: "unreadable_entry", path: "$", message: "persisted manifest could not be read" },
-      ];
+      return {
+        kind: "corrupt",
+        issues: [
+          { code: "unreadable_entry", path: "$", message: "persisted manifest could not be read" },
+        ],
+      };
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return [
-        { code: "invalid_json", path: "$", message: "persisted manifest is not valid JSON" },
-      ];
+      return {
+        kind: "corrupt",
+        issues: [
+          { code: "invalid_json", path: "$", message: "persisted manifest is not valid JSON" },
+        ],
+      };
     }
 
-    let manifest: SharedManifest;
+    let result: { manifest: SharedManifest; legacyUnkeyed: boolean };
     try {
-      manifest = validateSharedManifest(parsed);
+      result = validatePersistedManifest(parsed, true);
     } catch (err) {
-      if (err instanceof CorruptManifestError) return err.issues;
+      if (err instanceof CorruptManifestError) return { kind: "corrupt", issues: err.issues };
       throw err;
     }
 
     // The storage key is part of the contract: the file name must be the
     // SHA-256 of the batchId it claims to hold.
-    if (entry !== this.fileName(manifest.batchId)) {
-      return [
-        {
-          code: "batch_id_file_mismatch",
-          path: "$.batchId",
-          message: "batchId does not match the persisted file name binding",
-        },
-      ];
+    if (entry !== this.fileName(result.manifest.batchId)) {
+      return {
+        kind: "corrupt",
+        issues: [
+          {
+            code: "batch_id_file_mismatch",
+            path: "$.batchId",
+            message: "batchId does not match the persisted file name binding",
+          },
+        ],
+      };
     }
 
-    this.manifests.set(manifest.batchId, manifest);
-    return [];
+    if (result.legacyUnkeyed) {
+      return { kind: "legacy", manifest: result.manifest };
+    }
+    this.manifests.set(result.manifest.batchId, result.manifest);
+    return { kind: "current", manifest: result.manifest };
   }
 
   get(batchId: string): SharedManifest | undefined {
@@ -168,15 +232,18 @@ export class ManifestStore {
   ): Promise<CreateOutcome> {
     const existing = this.manifests.get(batchId);
     if (existing !== undefined) {
-      return existing.contentHash === contentDigest
+      // A migrated pre-upgrade entry carries a neutralized hash derived only
+      // from the old digest (the original identifiers are not recoverable),
+      // so equality against new content cannot be established; its key
+      // fingerprint differs as well. Every re-submission therefore answers
+      // with the existing 409 rather than risking an unknowable overwrite.
+      return existing.contentHash === contentDigest &&
+        existing.contentKeyId === manifest.contentKeyId
         ? { status: "replayed", manifest: existing }
         : { status: "conflict" };
     }
 
-    const target = join(this.dataDir, this.fileName(batchId));
-    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmp, JSON.stringify(manifest), { mode: 0o600 });
-    await rename(tmp, target);
+    await this.persist(manifest);
     this.manifests.set(batchId, manifest);
     return { status: "created", manifest };
   }

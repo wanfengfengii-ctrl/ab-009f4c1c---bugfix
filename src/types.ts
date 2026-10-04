@@ -37,6 +37,14 @@ export interface SharedManifest {
   batchId: string;
   createdAt: string;
   contentHash: string;
+  /**
+   * Versioned, non-revealing fingerprint of the deployment content key that
+   * produced contentHash. Present in every response so recipients can tell
+   * which key a hash is bound to; it is a hash of the key, never the key.
+   * "v1-neutralized" marks a pre-upgrade manifest whose unkeyed oracle hash
+   * was rewritten on recovery load.
+   */
+  contentKeyId: string;
   records: SharedRecord[];
 }
 

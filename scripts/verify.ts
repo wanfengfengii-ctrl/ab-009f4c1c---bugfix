@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Aliaser } from "../src/alias.ts";
-import { contentHash } from "../src/canonical.ts";
+import { canonicalize } from "../src/canonical.ts";
+import { contentKeyId, deriveContentKey, publicContentHash } from "../src/contentKey.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
@@ -80,7 +81,7 @@ async function getJson(path: string): Promise<{ status: number; json: any }> {
   return { status: res.status, json: await res.json() };
 }
 
-const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST"];
+const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST", "HASH-R-1", "HASH-P-1", "HASH-A-1"];
 
 function assertNoRawLeak(label: string, value: unknown): void {
   const text = JSON.stringify(value);
@@ -210,6 +211,66 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. Hash-oracle audit sample (single record, empty-ish measurements).
+    //    The exact batch from the audit; the publicly exposed contentHash
+    //    must NOT equal the ordinary SHA-256 a caller computes independently
+    //    from the raw business content, via POST or GET, and enumerating
+    //    candidate patient / accession / record ids over small sets must
+    //    never confirm a value.
+    const oracleBatch = {
+      batchId: "hash-oracle-audit",
+      records: [
+        {
+          recordId: "HASH-R-1",
+          patientId: "HASH-P-1",
+          accessionId: "HASH-A-1",
+          relatedIds: [],
+          measurements: { score: 7, flag: true },
+        },
+      ],
+    };
+    const oracle = await postJson("/api/manifests", oracleBatch);
+    assert(oracle.status === 201, `expected 201 for audit sample, got ${oracle.status}`);
+    assertNoRawLeak("audit sample response", oracle.json);
+    const oracleGet = await getJson("/api/manifests/hash-oracle-audit");
+    assert(oracleGet.status === 200, "audit sample must be queryable");
+    assert(
+      oracleGet.json.contentHash === oracle.json.contentHash,
+      "POST and GET must expose the same keyed hash",
+    );
+    assert(
+      typeof oracle.json.contentKeyId === "string" && /^v2-[0-9a-f]{16}$/.test(oracle.json.contentKeyId),
+      "response must carry the non-revealing content key fingerprint",
+    );
+    assert(
+      oracleGet.json.contentKeyId === oracle.json.contentKeyId,
+      "GET must expose the same content key fingerprint as POST",
+    );
+
+    const plain = createHash("sha256")
+      .update(canonicalize(validateBatch(oracleBatch)), "utf8")
+      .digest("hex");
+    assert(plain !== oracle.json.contentHash, "exposed hash must not be plain SHA-256 of raw content");
+
+    const candidateSets: Array<"recordId" | "patientId" | "accessionId"> = [
+      "recordId",
+      "patientId",
+      "accessionId",
+    ];
+    for (const cls of candidateSets) {
+      for (const guess of ["GUESS-0", "GUESS-1", "HASH-R-1", "HASH-P-1", "HASH-A-1"]) {
+        const candidate: any = JSON.parse(JSON.stringify(oracleBatch));
+        candidate.records[0][cls] = guess;
+        const guessedDigest = createHash("sha256")
+          .update(canonicalize(validateBatch(candidate)), "utf8")
+          .digest("hex");
+        assert(
+          guessedDigest !== oracle.json.contentHash,
+          `${cls} candidate ${guess} must not be confirmable from the exposed hash`,
+        );
+      }
+    }
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -233,9 +294,13 @@ async function runRecoverySmoke(): Promise<boolean> {
   const fileNameFor = (batchId: string): string =>
     createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
   const secret = Buffer.from("verify-recovery-secret-0123456789ab", "utf8");
+  const contentKey = deriveContentKey(secret);
+  const keyId = contentKeyId(contentKey);
+  const legacyHash = (b: ReturnType<typeof validateBatch>): string =>
+    createHash("sha256").update(canonicalize(b), "utf8").digest("hex");
 
   const expectCorruptLoad = async (dir: string, batchId: string): Promise<Error> => {
-    const store = new ManifestStore(dir);
+    const store = new ManifestStore(dir, contentKey);
     try {
       await store.load();
     } catch (err) {
@@ -264,11 +329,11 @@ async function runRecoverySmoke(): Promise<boolean> {
         },
       ],
     });
-    const hash = contentHash(batch);
-    const manifest = transformBatch(batch, new Aliaser(secret), hash);
-    const first = new ManifestStore(okDir);
+    const hash = publicContentHash(batch, contentKey);
+    const manifest = transformBatch(batch, new Aliaser(secret), hash, keyId);
+    const first = new ManifestStore(okDir, contentKey);
     assert((await first.create(batch.batchId, hash, manifest)).status === "created", "create failed");
-    const restored = new ManifestStore(okDir);
+    const restored = new ManifestStore(okDir, contentKey);
     await restored.load();
     assert(
       JSON.stringify(restored.get(batch.batchId)) === JSON.stringify(manifest),
@@ -320,6 +385,7 @@ async function runRecoverySmoke(): Promise<boolean> {
         batchId: "verify-recovery-dup",
         createdAt: "2026-10-04T00:00:00.000Z",
         contentHash: "0".repeat(64),
+        contentKeyId: keyId,
         records: [dupRecord, dupRecord],
       }),
     );
@@ -333,10 +399,67 @@ async function runRecoverySmoke(): Promise<boolean> {
         batchId: "verify-recovery-dangling",
         createdAt: "2026-10-04T00:00:00.000Z",
         contentHash: "0".repeat(64),
+        contentKeyId: keyId,
         records: [{ ...dupRecord, relatedAliases: [`rec-${"d".repeat(32)}`] }],
       }),
     );
     await expectCorruptLoad(danglingDir, "verify-recovery-dangling");
+
+    // 5. Pre-upgrade unkeyed manifest: structurally valid, no contentKeyId.
+    //    It must stay queryable while its plain hash-oracle is neutralized on
+    //    load and persisted (the rewrite survives a second restart).
+    const legacyDir = mkdtempSync(join(tmpdir(), "verify-recovery-legacy-"));
+    const legacyBatch = validateBatch({
+      batchId: "verify-recovery-legacy",
+      records: [
+        {
+          recordId: "SMOKE-R1",
+          patientId: "SMOKE-P1",
+          accessionId: "SMOKE-A1",
+          relatedIds: [],
+          measurements: { score: 7, flag: true },
+        },
+      ],
+    });
+    const oldHash = legacyHash(legacyBatch);
+    await writeFile(
+      join(legacyDir, fileNameFor("verify-recovery-legacy")),
+      JSON.stringify({
+        batchId: "verify-recovery-legacy",
+        createdAt: "2026-09-30T00:00:00.000Z",
+        contentHash: oldHash,
+        records: transformBatch(legacyBatch, new Aliaser(secret), oldHash, keyId).records,
+      }),
+    );
+    const legacyStore = new ManifestStore(legacyDir, contentKey);
+    await legacyStore.load();
+    const served = legacyStore.get("verify-recovery-legacy");
+    assert(served !== undefined, "a valid pre-upgrade manifest must remain queryable");
+    assert(served!.contentHash !== oldHash, "the unkeyed oracle hash must be replaced");
+    assert(
+      served!.contentHash !== createHash("sha256").update(oldHash, "utf8").digest("hex"),
+      "neutralization must not be a plain public transform of the old hash",
+    );
+    assert(served!.contentKeyId === "v1-neutralized", "migrated marker must be stamped");
+    const legacyAgain = new ManifestStore(legacyDir, contentKey);
+    await legacyAgain.load();
+    assert(
+      JSON.stringify(legacyAgain.get("verify-recovery-legacy")) === JSON.stringify(served),
+      "neutralization must be idempotent across restarts",
+    );
+    // A re-submission (same or different content) against the neutralized
+    // entry answers with the existing conflict semantics.
+    const replayed = transformBatch(
+      legacyBatch,
+      new Aliaser(secret),
+      publicContentHash(legacyBatch, contentKey),
+      keyId,
+    );
+    assert(
+      (await legacyStore.create("verify-recovery-legacy", publicContentHash(legacyBatch, contentKey), replayed))
+        .status === "conflict",
+      "re-submitting a neutralized entry must not silently overwrite it",
+    );
 
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;

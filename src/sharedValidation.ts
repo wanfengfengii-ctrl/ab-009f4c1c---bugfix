@@ -5,6 +5,7 @@ import type {
   ValidationIssue,
 } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
+import { CONTENT_KEY_ID_PATTERN } from "./contentKey.ts";
 import {
   BATCH_ID_PATTERN,
   FORBIDDEN_KEYS,
@@ -28,17 +29,33 @@ import {
  * served by GET nor silently overwritten.
  *
  * The contract enforced here mirrors exactly what the write path can produce:
- *  - the fixed field set {batchId, createdAt, contentHash, records}
+ *  - the fixed field set {batchId, createdAt, contentHash, contentKeyId, records}
  *  - batchId charset, ISO-8601 UTC createdAt, 64-hex contentHash
+ *  - contentKeyId: a conservative versioned fingerprint of the deployment
+ *    content key (present on every document the current write path produces)
  *  - per-category alias formats (pat-/acc-/rec- + 32 lowercase hex chars)
  *  - scalar measurement values under well-formed, non-reserved keys
  *  - recordAlias unique within the manifest
  *  - relatedAliases closed over the manifest's own record aliases
  *
+ * Recovery additionally admits PRE-upgrade documents (no contentKeyId field,
+ * contentHash an unkeyed SHA-256): those are structurally contract-compliant
+ * but flagged so the store can neutralize their hash-oracle before serving.
+ *
  * As with the inbound validator, issues report JSON paths and rule codes
  * only, never the offending values: a corrupt entry may be precisely the
  * place where raw identifiers live.
  */
+
+export interface PersistedValidationResult {
+  manifest: SharedManifest;
+  /**
+   * True for a pre-upgrade document that lacks contentKeyId: its unkeyed
+   * contentHash still offers a hash oracle and must be neutralized (and the
+   * field stamped) before the entry is admitted for serving.
+   */
+  legacyUnkeyed: boolean;
+}
 
 const CREATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
@@ -204,8 +221,21 @@ function validateSharedRecord(
  * Validate a persisted shared manifest against the current contract.
  * Throws {@link CorruptManifestError} collecting every issue found; returns
  * the normalized manifest only when the document is fully contract-compliant.
+ *
+ * @param allowLegacy when true (recovery load), a document lacking
+ *        contentKeyId is admitted as a pre-upgrade manifest and flagged via
+ *        {@link PersistedValidationResult.legacyUnkeyed}; every other rule,
+ *        including the 64-hex contentHash shape, still applies. The write
+ *        path and the strict contract tests use the default (false).
  */
 export function validateSharedManifest(raw: unknown): SharedManifest {
+  return validatePersistedManifest(raw, false).manifest;
+}
+
+export function validatePersistedManifest(
+  raw: unknown,
+  allowLegacy: boolean,
+): PersistedValidationResult {
   const issues = new IssueCollector();
 
   if (!isPlainObject(raw)) {
@@ -214,7 +244,7 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
     ]);
   }
 
-  const topAllowed = new Set(["batchId", "createdAt", "contentHash", "records"]);
+  const topAllowed = new Set(["batchId", "createdAt", "contentHash", "contentKeyId", "records"]);
   for (const key of Object.keys(raw)) {
     if (!topAllowed.has(key)) {
       issues.add("manifest_unknown_field", `$.${key}`, "unexpected top-level field");
@@ -246,6 +276,34 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
       "$.contentHash",
       "contentHash must be 64 lowercase hex characters",
     );
+  }
+
+  // contentKeyId is mandatory on the current contract. During recovery a
+  // missing field denotes a pre-upgrade (unkeyed-hash) document that the
+  // store will neutralize; a present-but-malformed value is always corrupt.
+  let legacyUnkeyed = false;
+  let contentKeyId = "";
+  if (raw.contentKeyId === undefined) {
+    if (!allowLegacy) {
+      issues.add(
+        "missing_content_key_id",
+        "$.contentKeyId",
+        "contentKeyId must identify the content key of the persisted manifest",
+      );
+    } else {
+      legacyUnkeyed = true;
+    }
+  } else if (
+    typeof raw.contentKeyId !== "string" ||
+    !CONTENT_KEY_ID_PATTERN.test(raw.contentKeyId)
+  ) {
+    issues.add(
+      "invalid_content_key_id",
+      "$.contentKeyId",
+      "contentKeyId must be a versioned key fingerprint",
+    );
+  } else {
+    contentKeyId = raw.contentKeyId;
   }
 
   const records: SharedRecord[] = [];
@@ -288,9 +346,13 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
 
   if (!issues.ok) throw new CorruptManifestError(issues.issues);
   return {
-    batchId,
-    createdAt: raw.createdAt as string,
-    contentHash: raw.contentHash as string,
-    records,
+    legacyUnkeyed,
+    manifest: {
+      batchId,
+      createdAt: raw.createdAt as string,
+      contentHash: raw.contentHash as string,
+      contentKeyId,
+      records,
+    },
   };
 }

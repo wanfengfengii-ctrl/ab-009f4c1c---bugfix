@@ -18,7 +18,7 @@ declare module "node:crypto" {
     digest(encoding: string): string;
   };
   type Hash = {
-    update(data: string, encoding?: string): Hash;
+    update(data: unknown, encoding?: string): Hash;
     digest(encoding?: string): string;
   };
   export function createHmac(algorithm: string, key: unknown): Hmac;
