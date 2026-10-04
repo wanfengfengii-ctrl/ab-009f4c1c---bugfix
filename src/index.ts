@@ -1,16 +1,19 @@
 import { loadConfig } from "./config.ts";
+import { ContentHasher } from "./hasher.ts";
 import { createAppServer } from "./http.ts";
 import { log } from "./log.ts";
 import { ManifestStore } from "./store.ts";
 
 async function main(): Promise<void> {
   const config = await loadConfig();
-  const store = new ManifestStore(config.dataDir);
+  const hasher = new ContentHasher(config.hashSecret);
+  const store = new ManifestStore(config.dataDir, hasher);
   await store.load();
 
   const server = createAppServer({
     store,
     aliasSecret: config.aliasSecret,
+    hasher,
     maxBodyBytes: config.maxBodyBytes,
   });
 

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { InputBatch, InputRecord } from "./types.ts";
 
 /**
@@ -7,7 +6,12 @@ import type { InputBatch, InputRecord } from "./types.ts";
  * The batchId is intentionally excluded: it is the storage key, not part of
  * the content compared for idempotency/conflict detection. Key order is made
  * deterministic and records are ordered by recordId so that semantically equal
- * submissions always produce the same digest.
+ * submissions always produce the same rendering.
+ *
+ * This module deliberately exposes NO digest of the canonical content: the
+ * pre-upgrade plain SHA-256 was returned to clients and acted as a
+ * guess-verification oracle over low-entropy identifiers. Public content
+ * digests are keyed with a deployment secret — see hasher.ts.
  */
 interface CanonicalRecord {
   recordId: string;
@@ -49,8 +53,4 @@ function stableStringify(value: unknown): string {
     .filter(([, v]) => v !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
-}
-
-export function contentHash(batch: InputBatch): string {
-  return createHash("sha256").update(canonicalize(batch), "utf8").digest("hex");
 }

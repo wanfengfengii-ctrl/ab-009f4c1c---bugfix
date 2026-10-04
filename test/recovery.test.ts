@@ -6,13 +6,17 @@ import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Aliaser } from "../src/alias.ts";
-import { contentHash } from "../src/canonical.ts";
+import { ContentHasher } from "../src/hasher.ts";
+import { canonicalize } from "../src/canonical.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const HASH_SECRET = Buffer.from("fedcba9876543210fedcba9876543210", "utf8");
+const hasher = new ContentHasher(HASH_SECRET);
+const keyedZeroHash = `hmac256-${"0".repeat(64)}`;
 
 function fileNameFor(batchId: string): string {
   return createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
@@ -68,13 +72,13 @@ async function writeEntry(dir: string, fileName: string, value: unknown): Promis
 test("recovery: a valid persisted manifest survives a restart", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-ok-"));
   const batch = validateBatch(validBody("batch-restore-ok"));
-  const hash = contentHash(batch);
+  const hash = hasher.contentHash(canonicalize(batch));
   const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
 
-  const first = new ManifestStore(dir);
+  const first = new ManifestStore(dir, hasher);
   assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, hasher);
   await restarted.load();
   assert.deepEqual(restarted.get("batch-restore-ok"), manifest);
   // Idempotency/conflict semantics are intact over restored entries.
@@ -82,18 +86,88 @@ test("recovery: a valid persisted manifest survives a restart", async () => {
   assert.equal((await restarted.create(batch.batchId, "different-hash", manifest)).status, "conflict");
 });
 
+test("recovery: a pre-upgrade manifest with a bare digest is migrated and keeps its semantics", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-migrate-"));
+  const batch = validateBatch(validBody("batch-legacy-upgrade"));
+  // Exactly what the pre-upgrade version persisted: aliases and plain SHA-256
+  // content digest in a correctly named file.
+  const legacyPlain = createHash("sha256").update(canonicalize(batch), "utf8").digest("hex");
+  const legacyManifest = transformBatch(batch, new Aliaser(SECRET), legacyPlain);
+  await writeEntry(dir, fileNameFor("batch-legacy-upgrade"), legacyManifest);
+
+  const upgraded = new ManifestStore(dir, hasher);
+  await upgraded.load();
+
+  // The GET-exposed value is now keyed; the publicly verifiable bare digest is
+  // gone from the served document.
+  const served = upgraded.get("batch-legacy-upgrade")!;
+  assert.equal(served.contentHash, hasher.migrateLegacyHash(legacyPlain));
+  assert.match(served.contentHash, /^hmac256-[0-9a-f]{64}$/);
+  assert.notEqual(served.contentHash, legacyPlain);
+  assert.ok(!JSON.stringify(served).includes(legacyPlain));
+
+  // Same-content retry after the upgrade still replays the original document
+  // (same createdAt), and different content still conflicts.
+  const currentHash = hasher.contentHash(canonicalize(batch));
+  assert.equal(currentHash, served.contentHash, "retry hash must equal the migrated hash");
+  const replayedManifest = transformBatch(batch, new Aliaser(SECRET), currentHash);
+  assert.equal(
+    (await upgraded.create(batch.batchId, currentHash, replayedManifest)).status,
+    "replayed",
+  );
+  assert.equal(
+    (await upgraded.create(batch.batchId, "hmac256-" + "f".repeat(64), replayedManifest)).status,
+    "conflict",
+  );
+
+  // Migration is idempotent across further restarts and leaves no bare digest.
+  const again = new ManifestStore(dir, hasher);
+  await again.load();
+  assert.equal(again.get("batch-legacy-upgrade")!.contentHash, served.contentHash);
+});
+
+test("recovery: a corrupt pre-upgrade entry is migrated-less and still aborts startup", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-legacy-corrupt-"));
+  // Legacy-shaped bare hash, but raw identifiers in the alias fields: the
+  // migration validator must refuse to wrap it and the fail-closed load must
+  // reject it without rewriting the file.
+  const entry = {
+    batchId: "legacy-corrupt",
+    createdAt: "2026-10-04T00:00:00.000Z",
+    contentHash: "a".repeat(64),
+    records: [
+      {
+        recordAlias: "HOSPITAL-REC-900",
+        patientAlias: "PATIENT-900",
+        accessionAlias: "ACCESSION-900",
+        relatedAliases: ["HOSPITAL-REC-900"],
+        measurements: {},
+      },
+    ],
+  };
+  await writeEntry(dir, fileNameFor("legacy-corrupt"), entry);
+
+  const store = new ManifestStore(dir, hasher);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("legacy-corrupt"), undefined);
+
+  // The file was not "migrated" into an apparently-valid keyed entry.
+  const raw = JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(join(dir, fileNameFor("legacy-corrupt")), "utf8")));
+  assert.equal(raw.contentHash, "a".repeat(64));
+});
+
 test("recovery: the corrupt restore-batch sample aborts startup and is never served", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-corrupt-"));
 
   // A fully valid entry sits next to the corrupt one.
   const batch = validateBatch(validBody("batch-healthy"));
-  const hash = contentHash(batch);
-  const first = new ManifestStore(dir);
+  const hash = hasher.contentHash(canonicalize(batch));
+  const first = new ManifestStore(dir, hasher);
   await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash));
 
   await writeEntry(dir, fileNameFor("restore-batch"), CORRUPT_SAMPLE);
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, hasher);
   let failure: unknown;
   try {
     await restarted.load();
@@ -137,11 +211,11 @@ test("recovery: duplicate record aliases in a persisted entry are rejected", asy
   await writeEntry(dir, fileNameFor("batch-dup-alias"), {
     batchId: "batch-dup-alias",
     createdAt: "2026-10-04T00:00:00.000Z",
-    contentHash: "0".repeat(64),
+    contentHash: keyedZeroHash,
     records: [record, { ...record }],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, hasher);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dup-alias"), undefined);
 });
@@ -151,7 +225,7 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
   await writeEntry(dir, fileNameFor("batch-dangling-alias"), {
     batchId: "batch-dangling-alias",
     createdAt: "2026-10-04T00:00:00.000Z",
-    contentHash: "0".repeat(64),
+    contentHash: keyedZeroHash,
     records: [
       {
         recordAlias: `rec-${"a".repeat(32)}`,
@@ -163,7 +237,7 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
     ],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, hasher);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dangling-alias"), undefined);
 });
@@ -171,12 +245,12 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
 test("recovery: file name must match the SHA-256 binding of its batchId", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-binding-"));
   const batch = validateBatch(validBody("batch-binding"));
-  const hash = contentHash(batch);
+  const hash = hasher.contentHash(canonicalize(batch));
   const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
   // Persist the valid document under the WRONG file name.
   await writeEntry(dir, fileNameFor("some-other-batch"), manifest);
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, hasher);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-binding"), undefined);
 });
@@ -185,13 +259,13 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-json-"));
   await writeEntry(dir, fileNameFor("batch-broken"), "{not valid json");
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, hasher);
   await assert.rejects(store.load(), CorruptStoreError);
 });
 
 test("shared manifest contract: field set, formats and scalar measurements", () => {
   const batch = validateBatch(validBody("batch-contract"));
-  const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));
+  const good = transformBatch(batch, new Aliaser(SECRET), hasher.contentHash(canonicalize(batch)));
   // A manifest produced by the write path always satisfies the contract.
   assert.deepEqual(validateSharedManifest(JSON.parse(JSON.stringify(good))), good);
 
@@ -216,6 +290,16 @@ test("shared manifest contract: field set, formats and scalar measurements", () 
     {
       name: "contentHash wrong length",
       mutate: (m) => (m.contentHash = "abcd"),
+      code: "invalid_content_hash",
+    },
+    {
+      name: "legacy bare SHA-256 contentHash is rejected on the recovery path",
+      mutate: (m) => (m.contentHash = "a".repeat(64)),
+      code: "invalid_content_hash",
+    },
+    {
+      name: "keyed contentHash with wrong prefix",
+      mutate: (m) => (m.contentHash = `sha256-${"a".repeat(64)}`),
       code: "invalid_content_hash",
     },
     {

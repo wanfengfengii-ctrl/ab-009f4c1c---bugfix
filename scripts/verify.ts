@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Aliaser } from "../src/alias.ts";
-import { contentHash } from "../src/canonical.ts";
+import { ContentHasher } from "../src/hasher.ts";
+import { canonicalize } from "../src/canonical.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
@@ -119,6 +120,10 @@ async function runSmoke(): Promise<boolean> {
     const created = await postJson("/api/manifests", batchOne);
     assert(created.status === 201, `expected 201, got ${created.status}`);
     assertNoRawLeak("create response", created.json);
+    assert(
+      /^hmac256-[0-9a-f]{64}$/.test(created.json.contentHash),
+      "contentHash must be the keyed hmac256- form",
+    );
     const createdText = JSON.stringify(created.json);
     for (const prefix of ["rec-", "pat-", "acc-"]) {
       assert(createdText.includes(prefix), `create response missing ${prefix} aliases`);
@@ -210,6 +215,70 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. Hash-oracle regression: the confirmed single-record sample and a
+    //    single-record/empty-measurements variant. A recipient without the
+    //    deployment secret enumerates low-entropy candidates for patient,
+    //    accession AND record ids using only plain SHA-256 over the canonical
+    //    rendering; even the true candidate must not match POST or GET.
+    const publicDigest = (content: unknown): string =>
+      createHash("sha256").update(canonicalize(validateBatch(content)), "utf8").digest("hex");
+    const oracleBatches: Array<{
+      batchId: string;
+      record: Record<string, unknown>;
+      fields: Array<{ name: "recordId" | "patientId" | "accessionId"; prefix: string; max: number }>;
+    }> = [
+      {
+        batchId: "hash-oracle-audit",
+        record: {
+          recordId: "HASH-R-1",
+          patientId: "HASH-P-1",
+          accessionId: "HASH-A-1",
+          relatedIds: [],
+          measurements: { score: 7, flag: true },
+        },
+        fields: [
+          { name: "recordId", prefix: "HASH-R-", max: 2 },
+          { name: "patientId", prefix: "HASH-P-", max: 2 },
+          { name: "accessionId", prefix: "HASH-A-", max: 2 },
+        ],
+      },
+      {
+        batchId: "oracle-smoke-empty",
+        record: {
+          recordId: "OSR-3",
+          patientId: "OSP-3",
+          accessionId: "OSA-3",
+          relatedIds: [],
+          measurements: {},
+        },
+        fields: [
+          { name: "recordId", prefix: "OSR-", max: 5 },
+          { name: "patientId", prefix: "OSP-", max: 5 },
+          { name: "accessionId", prefix: "OSA-", max: 5 },
+        ],
+      },
+    ];
+    for (const oracle of oracleBatches) {
+      const accepted = await postJson("/api/manifests", { batchId: oracle.batchId, records: [oracle.record] });
+      assert(accepted.status === 201, `oracle case ${oracle.batchId} create failed: ${accepted.status}`);
+      const exposed: string = accepted.json.contentHash;
+      assert(/^hmac256-[0-9a-f]{64}$/.test(exposed), "exposed digest must be keyed");
+      assert(!/^[0-9a-f]{64}$/.test(exposed), "exposed digest must not be a bare hash");
+
+      const fetched = await getJson(`/api/manifests/${oracle.batchId}`);
+      assert(fetched.json.contentHash === exposed, "GET must expose the same keyed digest");
+
+      for (const field of oracle.fields) {
+        for (let n = 0; n <= field.max; n++) {
+          const candidateRecord = { ...oracle.record, [field.name]: `${field.prefix}${n}` };
+          assert(
+            publicDigest({ batchId: oracle.batchId, records: [candidateRecord] }) !== exposed,
+            `plain digest of ${field.name} candidate ${n} must not match the public value`,
+          );
+        }
+      }
+    }
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -233,9 +302,11 @@ async function runRecoverySmoke(): Promise<boolean> {
   const fileNameFor = (batchId: string): string =>
     createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
   const secret = Buffer.from("verify-recovery-secret-0123456789ab", "utf8");
+  const hashSecret = Buffer.from("verify-content-hash-secret-abcdef9876543210", "utf8");
+  const hasher = new ContentHasher(hashSecret);
 
   const expectCorruptLoad = async (dir: string, batchId: string): Promise<Error> => {
-    const store = new ManifestStore(dir);
+    const store = new ManifestStore(dir, hasher);
     try {
       await store.load();
     } catch (err) {
@@ -264,11 +335,11 @@ async function runRecoverySmoke(): Promise<boolean> {
         },
       ],
     });
-    const hash = contentHash(batch);
+    const hash = hasher.contentHash(canonicalize(batch));
     const manifest = transformBatch(batch, new Aliaser(secret), hash);
-    const first = new ManifestStore(okDir);
+    const first = new ManifestStore(okDir, hasher);
     assert((await first.create(batch.batchId, hash, manifest)).status === "created", "create failed");
-    const restored = new ManifestStore(okDir);
+    const restored = new ManifestStore(okDir, hasher);
     await restored.load();
     assert(
       JSON.stringify(restored.get(batch.batchId)) === JSON.stringify(manifest),
@@ -276,8 +347,35 @@ async function runRecoverySmoke(): Promise<boolean> {
     );
     assert(
       (await restored.create(batch.batchId, hash, manifest)).status === "replayed" &&
-        (await restored.create(batch.batchId, "other-hash", manifest)).status === "conflict",
+        (await restored.create(batch.batchId, "hmac256-" + "f".repeat(64), manifest)).status === "conflict",
       "replay/conflict semantics must hold over restored entries",
+    );
+
+    // 1b. A pre-upgrade manifest (bare SHA-256 digest) is migrated on load:
+    //     GET then exposes only the keyed digest, same-content retries still
+    //     replay and different content still conflicts.
+    const legacyDir = mkdtempSync(join(tmpdir(), "verify-recovery-legacy-"));
+    const legacyPlain = createHash("sha256").update(canonicalize(batch), "utf8").digest("hex");
+    const legacyManifest = transformBatch(batch, new Aliaser(secret), legacyPlain);
+    await writeFile(
+      join(legacyDir, fileNameFor("verify-recovery-ok")),
+      JSON.stringify(legacyManifest),
+    );
+    const migratedStore = new ManifestStore(legacyDir, hasher);
+    await migratedStore.load();
+    const served = migratedStore.get("verify-recovery-ok");
+    assert(served !== undefined, "a migrated pre-upgrade manifest must be queryable");
+    assert(
+      served!.contentHash === hash && /^hmac256-[0-9a-f]{64}$/.test(served!.contentHash),
+      "the exposed digest must be the migrated keyed form",
+    );
+    assert(
+      !JSON.stringify(served).includes(legacyPlain),
+      "the old publicly verifiable digest must no longer be exposed",
+    );
+    assert(
+      (await migratedStore.create("verify-recovery-ok", hash, manifest)).status === "replayed",
+      "same-content retry must still replay after migration",
     );
 
     // 2. The confirmed corrupt sample: hash-rule file name, valid JSON, but
@@ -319,7 +417,7 @@ async function runRecoverySmoke(): Promise<boolean> {
       JSON.stringify({
         batchId: "verify-recovery-dup",
         createdAt: "2026-10-04T00:00:00.000Z",
-        contentHash: "0".repeat(64),
+        contentHash: `hmac256-${"0".repeat(64)}`,
         records: [dupRecord, dupRecord],
       }),
     );
@@ -332,7 +430,7 @@ async function runRecoverySmoke(): Promise<boolean> {
       JSON.stringify({
         batchId: "verify-recovery-dangling",
         createdAt: "2026-10-04T00:00:00.000Z",
-        contentHash: "0".repeat(64),
+        contentHash: `hmac256-${"0".repeat(64)}`,
         records: [{ ...dupRecord, relatedAliases: [`rec-${"d".repeat(32)}`] }],
       }),
     );

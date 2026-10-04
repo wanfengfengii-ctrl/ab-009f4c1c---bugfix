@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Aliaser } from "../src/alias.ts";
-import { contentHash, canonicalize } from "../src/canonical.ts";
+import { ContentHasher } from "../src/hasher.ts";
+import { canonicalize } from "../src/canonical.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 import { ManifestStore } from "../src/store.ts";
@@ -10,6 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const HASH_SECRET = Buffer.from("fedcba9876543210fedcba9876543210", "utf8");
+const hasher = new ContentHasher(HASH_SECRET);
+const digest = (body: unknown): string => hasher.contentHash(canonicalize(validateBatch(body)));
 
 function validBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -68,7 +72,7 @@ test("aliases are stable across batches and isolated across identifier classes",
 
 test("transform preserves reference closure and measurement values", () => {
   const batch = validateBatch(validBody());
-  const manifest = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));
+  const manifest = transformBatch(batch, new Aliaser(SECRET), digest(validBody()));
 
   const aliases = new Set(manifest.records.map((r) => r.recordAlias));
   for (const record of manifest.records) {
@@ -95,7 +99,7 @@ test("transform preserves reference closure and measurement values", () => {
   }
 });
 
-test("canonical hash ignores record/key ordering but detects content changes", () => {
+test("canonical rendering ignores record/key ordering but detects content changes", () => {
   const reordered = validBody({
     records: [
       {
@@ -114,18 +118,74 @@ test("canonical hash ignores record/key ordering but detects content changes", (
       },
     ],
   });
-  const h1 = contentHash(validateBatch(validBody()));
-  const h2 = contentHash(validateBatch(reordered));
-  assert.equal(h1, h2);
-  assert.equal(canonicalize(validateBatch(validBody())), canonicalize(validateBatch(reordered)));
+  const c1 = canonicalize(validateBatch(validBody()));
+  const c2 = canonicalize(validateBatch(reordered));
+  assert.equal(c1, c2);
 
   const changed = validBody();
   (changed.records as any[])[1].measurements.ki67 = 31;
-  assert.notEqual(contentHash(validateBatch(changed)), h1);
+  assert.notEqual(digest(changed), digest(validBody()));
 
   // batchId is not part of business content.
   const otherBatchId = validBody({ batchId: "batch-B" });
-  assert.equal(contentHash(validateBatch(otherBatchId)), h1);
+  assert.equal(digest(otherBatchId), digest(validBody()));
+});
+
+test("content digest is keyed and cannot be verified without the deployment secret", async () => {
+  const { createHash, createHmac } = await import("node:crypto");
+  const auditBody = {
+    batchId: "hash-oracle-audit",
+    records: [
+      {
+        recordId: "HASH-R-1",
+        patientId: "HASH-P-1",
+        accessionId: "HASH-A-1",
+        relatedIds: [],
+        measurements: { score: 7, flag: true },
+      },
+    ],
+  };
+  const canonical = canonicalize(validateBatch(auditBody));
+  const hash = hasher.contentHash(canonical);
+
+  // Current shape: explicitly keyed and prefixed.
+  assert.match(hash, /^hmac256-[0-9a-f]{64}$/);
+
+  // The pre-fix plain SHA-256 oracle must no longer match, even though the
+  // attacker knows every other business field and the canonicalization.
+  const plain = createHash("sha256").update(canonical, "utf8").digest("hex");
+  assert.notEqual(hash, plain);
+  assert.ok(!hash.includes(plain));
+
+  // Enumerating candidate patient ids using only public hash computation fails.
+  for (const candidate of ["HASH-P-0", "HASH-P-1", "HASH-P-2"]) {
+    const body = {
+      ...auditBody,
+      records: [{ ...auditBody.records[0], patientId: candidate }],
+    };
+    assert.notEqual(
+      createHash("sha256").update(canonicalize(validateBatch(body)), "utf8").digest("hex"),
+      hash,
+      `plain digest of candidate ${candidate} must not equal the public content hash`,
+    );
+  }
+
+  // A different deployment secret yields a different digest for identical content.
+  const otherHasher = new ContentHasher(Buffer.from("0123456789abcdeffedcba9876543210", "utf8"));
+  assert.notEqual(otherHasher.contentHash(canonical), hash);
+
+  // Legacy migration is content-preserving: HMAC(secret, legacyPlainHash)
+  // equals the value the new rule computes for the same content.
+  const migrated = hasher.migrateLegacyHash(plain);
+  assert.equal(
+    migrated,
+    hash,
+    "wrapping a persisted legacy digest must equal the freshly keyed digest",
+  );
+  assert.equal(
+    migrated,
+    `hmac256-${createHmac("sha256", HASH_SECRET).update(plain, "utf8").digest("hex")}`,
+  );
 });
 
 test("validation rejects duplicate recordIds with 422-style failure", () => {
@@ -229,10 +289,11 @@ test("validation rejects illegal structures and never echoes identifier values",
 
 test("store: create / replay / conflict semantics, persisted to disk", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-store-"));
-  const store = new ManifestStore(dir);
-  // Hashes use the real 64-hex shape: only contract-valid documents are ever persisted.
-  const hash1 = "1".repeat(64);
-  const hash2 = "2".repeat(64);
+  const store = new ManifestStore(dir, hasher);
+  // Hashes use the real prefixed 64-hex shape: only contract-valid documents
+  // are ever persisted.
+  const hash1 = `hmac256-${"1".repeat(64)}`;
+  const hash2 = `hmac256-${"2".repeat(64)}`;
   const manifest = transformBatch(
     validateBatch(validBody()),
     new Aliaser(SECRET),
@@ -245,7 +306,7 @@ test("store: create / replay / conflict semantics, persisted to disk", async () 
   assert.deepEqual(store.get("batch-A")?.contentHash, hash1);
 
   // A fresh store over the same directory restores manifests.
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, hasher);
   await restarted.load();
   assert.equal(restarted.get("batch-A")?.contentHash, hash1);
   assert.equal((await restarted.create("batch-A", hash1, manifest)).status, "replayed");

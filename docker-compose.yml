@@ -11,6 +11,9 @@
 #   MANIFEST_ALIAS_SECRET  deployment secret for deterministic aliases; if
 #                          omitted a random 32-byte secret is generated and
 #                          persisted in the data volume (single-node default)
+#   MANIFEST_HASH_SECRET   deployment secret for the keyed content digest;
+#                          same default/persistence rules. Must differ from
+#                          MANIFEST_ALIAS_SECRET.
 
 services:
   api:
@@ -22,6 +25,7 @@ services:
       PORT: "8080"
       DATA_DIR: /data
       MANIFEST_ALIAS_SECRET: "${MANIFEST_ALIAS_SECRET:-}"
+      MANIFEST_HASH_SECRET: "${MANIFEST_HASH_SECRET:-}"
       MAX_BODY_BYTES: "${MAX_BODY_BYTES:-10485760}"
     ports:
       - "${API_HOST_PORT:-8080}:8080"

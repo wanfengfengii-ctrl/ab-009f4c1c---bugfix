@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
+import { ContentHasher } from "./hasher.ts";
 import { log } from "./log.ts";
 
 /**
@@ -55,9 +56,11 @@ export class ManifestStore {
   private readonly locks = new Map<string, Promise<unknown>>();
 
   private readonly dataDir: string;
+  private readonly hasher: ContentHasher;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, hasher: ContentHasher) {
     this.dataDir = dataDir;
+    this.hasher = hasher;
     mkdirSync(dataDir, { recursive: true });
   }
 
@@ -65,7 +68,78 @@ export class ManifestStore {
     return createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
   }
 
+  /**
+   * One-time migration of pre-upgrade manifests.
+   *
+   * Before the keyed content digest was introduced, persisted documents stored
+   * a bare SHA-256 of the business content. Such a digest keeps offering the
+   * guess-verification oracle even after an upgrade, since GET serves the
+   * stored value and the digest is publicly recomputable. Every legacy hash is
+   * therefore wrapped into the current keyed form (hmac256- HMAC over the bare
+   * digest) and atomically rewritten before any entry is admitted or served.
+   *
+   * Wrapping preserves idempotency: a same-content retry under the new rule
+   * hashes the same canonical text to the same bare digest and keys it with the
+   * same secret, so it compares equal to the migrated value.
+   *
+   * Entries that fail to parse or do not carry a bare 64-hex hash are left
+   * untouched; the regular fail-closed load then validates (and, if needed,
+   * rejects) them. Diagnostics stay identifier-free: only the migrated count
+   * is logged.
+   */
+  private async migrateLegacyHashes(): Promise<void> {
+    let migrated = 0;
+    const entries = await readdir(this.dataDir);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const target = join(this.dataDir, entry);
+
+      let raw: string;
+      try {
+        raw = await readFile(target, "utf8");
+      } catch {
+        continue; // inspectEntry reports unreadable entries during load
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue; // inspectEntry reports malformed JSON during load
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+
+      const document = parsed as { contentHash?: unknown };
+      if (!ContentHasher.isLegacyHash(document.contentHash)) continue;
+
+      // Only migrate entries that satisfy the entire current contract except
+      // for the (legacy) digest shape — including the file-name <-> batchId
+      // binding. Anything else is left untouched and subsequently rejected by
+      // the fail-closed load, so a corrupt entry is never silently rewritten.
+      let manifest: SharedManifest;
+      try {
+        manifest = validateSharedManifest(parsed, { allowLegacyContentHash: true });
+      } catch (err) {
+        if (err instanceof CorruptManifestError) continue;
+        throw err;
+      }
+      if (entry !== this.fileName(manifest.batchId)) continue;
+
+      document.contentHash = this.hasher.migrateLegacyHash(document.contentHash as string);
+      const tmp = `${target}.${process.pid}.${Date.now()}.migrate`;
+      await writeFile(tmp, JSON.stringify(document), { mode: 0o600 });
+      await rename(tmp, target);
+      migrated++;
+    }
+    if (migrated > 0) {
+      log.info("legacy_content_hashes_migrated", { manifests: migrated });
+    }
+  }
+
   async load(): Promise<void> {
+    // Pre-upgrade entries must lose their publicly verifiable digest before
+    // any of them can be served or compared.
+    await this.migrateLegacyHashes();
+
     const entries = await readdir(this.dataDir);
     const corrupt: Array<{ file: string; issues: ValidationIssue[] }> = [];
     let count = 0;

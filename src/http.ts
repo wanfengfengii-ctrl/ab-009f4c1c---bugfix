@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { Aliaser } from "./alias.ts";
-import { contentHash } from "./canonical.ts";
+import { ContentHasher } from "./hasher.ts";
+import { canonicalize } from "./canonical.ts";
 import { transformBatch } from "./transform.ts";
 import { BATCH_ID_PATTERN, validateBatch } from "./validation.ts";
 import { log } from "./log.ts";
@@ -25,11 +26,12 @@ class HttpError extends Error {
 export interface ServerDeps {
   store: ManifestStore;
   aliasSecret: Buffer;
+  hasher: ContentHasher;
   maxBodyBytes: number;
 }
 
 export function createAppServer(deps: ServerDeps) {
-  const { store, aliasSecret, maxBodyBytes } = deps;
+  const { store, aliasSecret, hasher, maxBodyBytes } = deps;
 
   function sendJson(res: any, status: number, payload: unknown): void {
     const body = JSON.stringify(payload);
@@ -78,7 +80,9 @@ export function createAppServer(deps: ServerDeps) {
     // validateBatch throws ValidationFailed listing only paths/rule codes,
     // never the submitted identifier values.
     const batch = validateBatch(raw);
-    const hash = contentHash(batch);
+    // Keyed digest: a recipient without the deployment hash secret cannot
+    // verify candidate business contents against the returned value.
+    const hash = hasher.contentHash(canonicalize(batch));
 
     // The aliaser is request scoped; the deployment secret is what makes
     // aliases consistent across batches.

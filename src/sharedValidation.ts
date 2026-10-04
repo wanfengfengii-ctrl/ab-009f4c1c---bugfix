@@ -41,10 +41,26 @@ import {
  */
 
 const CREATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
+/**
+ * Current content digest: keyed with a deployment secret and explicitly
+ * prefixed. A bare 64-hex value (the pre-upgrade plain SHA-256) is NOT valid
+ * on the recovery path: such an entry must be migrated before it is admitted
+ * or served, otherwise GET would keep offering the guess-verification oracle.
+ */
+const CONTENT_HASH_PATTERN = /^hmac256-[0-9a-f]{64}$/;
+const LEGACY_CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const RECORD_ALIAS_PATTERN = /^rec-[0-9a-f]{32}$/;
 const PATIENT_ALIAS_PATTERN = /^pat-[0-9a-f]{32}$/;
 const ACCESSION_ALIAS_PATTERN = /^acc-[0-9a-f]{32}$/;
+
+export interface SharedValidationOptions {
+  /**
+   * Migration-only: accept a pre-upgrade bare 64-hex content digest so an
+   * otherwise valid entry can be identified and wrapped with the deployment
+   * key. Never set on the regular recovery path.
+   */
+  allowLegacyContentHash?: boolean;
+}
 
 class IssueCollector {
   readonly issues: ValidationIssue[] = [];
@@ -205,7 +221,10 @@ function validateSharedRecord(
  * Throws {@link CorruptManifestError} collecting every issue found; returns
  * the normalized manifest only when the document is fully contract-compliant.
  */
-export function validateSharedManifest(raw: unknown): SharedManifest {
+export function validateSharedManifest(
+  raw: unknown,
+  options: SharedValidationOptions = {},
+): SharedManifest {
   const issues = new IssueCollector();
 
   if (!isPlainObject(raw)) {
@@ -240,11 +259,15 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
     );
   }
 
-  if (typeof raw.contentHash !== "string" || !CONTENT_HASH_PATTERN.test(raw.contentHash)) {
+  if (
+    typeof raw.contentHash !== "string" ||
+    !CONTENT_HASH_PATTERN.test(raw.contentHash) &&
+      !(options.allowLegacyContentHash && LEGACY_CONTENT_HASH_PATTERN.test(raw.contentHash))
+  ) {
     issues.add(
       "invalid_content_hash",
       "$.contentHash",
-      "contentHash must be 64 lowercase hex characters",
+      "contentHash must be hmac256-<64 lowercase hex characters>",
     );
   }
 

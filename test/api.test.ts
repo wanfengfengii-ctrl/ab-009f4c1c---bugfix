@@ -1,12 +1,17 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAppServer } from "../src/http.ts";
+import { ContentHasher } from "../src/hasher.ts";
+import { canonicalize } from "../src/canonical.ts";
+import { validateBatch } from "../src/validation.ts";
 import { ManifestStore } from "../src/store.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const HASH_SECRET = Buffer.from("fedcba9876543210fedcba9876543210", "utf8");
 const RAW_IDS = ["R-100", "R-200", "PAT-X", "ACC-X"];
 
 function batchA(): any {
@@ -36,9 +41,10 @@ let server: any;
 
 before(async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-api-"));
-  const store = new ManifestStore(dir);
+  const hasher = new ContentHasher(HASH_SECRET);
+  const store = new ManifestStore(dir, hasher);
   await store.load();
-  server = createAppServer({ store, aliasSecret: SECRET, maxBodyBytes: 1_000_000 });
+  server = createAppServer({ store, aliasSecret: SECRET, hasher, maxBodyBytes: 1_000_000 });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
@@ -60,7 +66,7 @@ test("POST valid manifest returns an alias-only, reference-closed shared copy", 
   const { status, json } = await post(batchA());
   assert.equal(status, 201);
   assert.equal(json.batchId, "batch-A");
-  assert.match(json.contentHash, /^[0-9a-f]{64}$/);
+  assert.match(json.contentHash, /^hmac256-[0-9a-f]{64}$/);
   assert.equal(json.records.length, 2);
 
   const serialized = JSON.stringify(json);
@@ -183,4 +189,55 @@ test("aliases stay consistent across batches while identifier classes stay isola
   assert.notEqual(dup.recordAlias, dup.patientAlias);
   assert.notEqual(dup.recordAlias, dup.accessionAlias);
   assert.notEqual(dup.patientAlias, dup.accessionAlias);
+});
+
+test("public contentHash cannot verify low-entropy guesses for any identifier class", async () => {
+  // Single record, empty measurements: the sparsest case still exposes no
+  // plaintext-verifiable digest via POST or GET.
+  const oracleBodies: Array<{ batchId: string; field: "recordId" | "patientId" | "accessionId"; real: string }> = [
+    { batchId: "oracle-record", field: "recordId", real: "ORC-R-7" },
+    { batchId: "oracle-patient", field: "patientId", real: "ORC-P-7" },
+    { batchId: "oracle-accession", field: "accessionId", real: "ORC-A-7" },
+  ];
+
+  for (const { batchId, field, real } of oracleBodies) {
+    const record: any = {
+      recordId: "ORC-R-0",
+      patientId: "ORC-P-0",
+      accessionId: "ORC-A-0",
+      relatedIds: [],
+      measurements: {},
+    };
+    record[field] = real;
+
+    const { status, json } = await post({ batchId, records: [record] });
+    assert.equal(status, 201, `create for ${field} oracle case failed`);
+    const publicHash: string = json.contentHash;
+    assert.match(publicHash, /^hmac256-[0-9a-f]{64}$/);
+
+    // The GET exposure carries the same unguessable value.
+    const fetched = await (await fetch(`${baseUrl}/api/manifests/${batchId}`)).json();
+    assert.equal(fetched.contentHash, publicHash);
+
+    // Attacker enumerates the small candidate set using only public
+    // information (canonical rendering + plain SHA-256, no deployment secret):
+    // no candidate, including the true value, must match.
+    for (let n = 0; n <= 9; n++) {
+      const guessRecord = { ...record };
+      guessRecord[field] = `ORC-${field === "recordId" ? "R" : field === "patientId" ? "P" : "A"}-${n}`;
+      const plain = createHash("sha256")
+        .update(canonicalize(validateBatch({ batchId, records: [guessRecord] })), "utf8")
+        .digest("hex");
+      assert.notEqual(plain, publicHash, `${field} candidate ${n} must not be verifiable from POST value`);
+      assert.ok(!publicHash.includes(plain));
+    }
+
+    // Sanity: the true value is in the candidate space and still does not match.
+    const trueRecord = { ...record };
+    trueRecord[field] = real;
+    const truePlain = createHash("sha256")
+      .update(canonicalize(validateBatch({ batchId, records: [trueRecord] })), "utf8")
+      .digest("hex");
+    assert.notEqual(truePlain, publicHash, "even the correct guess must be indistinguishable");
+  }
 });
